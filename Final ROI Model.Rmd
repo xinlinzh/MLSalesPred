@@ -1,0 +1,411 @@
+---
+title: "FINAL ROI Model"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+####setup
+
+```{r setup2, include=FALSE}
+rm(list = ls())
+
+library(kknn)
+library(tidyverse)
+library(randomForest)
+library(gbm)
+library(caret)
+library(nnet)
+library(raster)
+library(keras)
+library(ggplot2)
+library(dplyr)
+library(plotly)
+library(kernlab)
+library(e1071)
+
+setwd(getwd())
+
+heb = read.csv("Finals-Data-HEBnn.csv")
+kroger = read.csv("Finals-Data-Krogernn.csv")
+publix = read.csv("Finals-Data-Publixnn.csv")
+safeway = read.csv("Finals-Data-Safewaynn.csv")
+
+#exclude edlp = y
+drop = c("UnitSales", "DollarSales", "IncrDollars","IncrUnits",
+         "WklyPricePerUnitTtlAvg", "UnitsFeatOnly", 
+         "UnitsDispOnly","UnitsTPROnly","UnitsFeatandDisp","Key","FirstMatchingPromo",
+         "FirstMatchingTactic","Incr.Total","BasePriceIRIBased","AverageListPrice",
+         "EDLP.Y.N.","EDLP","EDLPSpend","PromotedListPrice","Spend.BasedonListPrice.Margins",
+         "TotalSpend","PromoIncremental","EDLPIncremental","EDLP.ROI","ROI","WklyPricePerUnitNoPromo",
+         "ElasticityReference","IsPromotion")
+
+######################################
+#### takeout all the roi = 0 #########
+######################################
+
+total2 = rbind(heb, kroger, publix, safeway)
+total2 = total2[total2$ROI!=0,]
+
+total2$ROI.factor = "horrible"
+
+for (i in 1:nrow(total2)){
+  if (total2$ROI[i] > -1){
+    total2$ROI.factor[i] = "bad"}
+  if (total2$ROI[i] > 0){
+    total2$ROI.factor[i] = "good"}
+  if (total2$ROI[i] > 1){
+    total2$ROI.factor[i] = "great"}
+}
+
+total2 = total2%>%
+  dplyr::select(-drop)
+
+
+total2$ROI.factor = as.factor(total2$ROI.factor)
+total2$ROI.factor = factor(total2$ROI.factor,levels(total2$ROI.factor)[c(4,1:3)])
+#names(total2)
+#write.csv(total2, "total.csv")
+set.seed(0121)
+id = sample(nrow(total2), 0.6*nrow(total2))
+train2 = total2[id,]
+validation2 = total2[-id,]
+
+table(total2$ROI.factor)
+
+compare = function(x, y){
+  score = 0
+  for (i in 1:nrow(x)){
+    if (x[i,] == y[i,]){
+      score = score + 1
+    }
+  }
+  return(score)
+}
+
+```
+
+#####Boosting
+
+
+
+```{r boosting}
+############################### boosting #############################
+idv = c(2,4)
+ntv = c(500,1000)
+shv = c(.1,.01)
+setboost = expand.grid(idv,ntv,shv)
+colnames(setboost) = c("tdepth","ntree","shrink")
+setboost$misrate = 0
+
+for(i in 1:nrow(setboost)) {
+  fboost = gbm(ROI.factor~., data=train2, 
+               distribution="multinomial",
+               interaction.depth=setboost[i,1],
+               n.trees=setboost[i,2],
+               shrinkage=setboost[i,3])
+  phat = predict(fboost,
+                 newdata=validation2,
+                 n.trees=setboost[i,2],
+                 type="response")
+  boosting.predict = data.frame(matrix(0, nrow = nrow(phat), ncol = 1))
+  for (j in 1:nrow(phat)){
+    label = names(which.max(phat[j,,]))
+    boosting.predict[j,1] = label
+  }
+  misclrate = 1-compare(boosting.predict, as.data.frame(validation2[["ROI.factor"]]))/nrow(validation2)
+  setboost[i,4] = misclrate
+}
+
+### pick the lowest mr
+idx=which.min(setboost$misrate)
+boostfit = gbm(ROI.factor~., data=train2, 
+               distribution="multinomial",
+               interaction.depth=setboost[idx,1],
+               n.trees=setboost[idx,2],
+               shrinkage=setboost[idx,3])
+
+#Variable importance plot
+p=ncol(train2)-1
+vsum=summary(boostfit, plotit=F) #this will have the variable importance info
+#plot variable importance
+plot(vsum$rel.inf,axes=F,pch=16,col='red')
+axis(1,labels=vsum$var,at=1:p)
+axis(2)
+for(i in 1:p) lines(c(i,i),c(0,vsum$rel.inf[i]),lwd=4,col='blue')
+
+#Boosting model predicts probabilities.
+b.predict = predict(boostfit,
+                    newdata=validation2,
+                    n.trees=setboost[idx,2],
+                    type="response")
+boosting.predict = data.frame(matrix(0, nrow = nrow(b.predict), ncol = 1))
+for (j in 1:nrow(b.predict)){
+  label = names(which.max(b.predict[j,,]))
+  boosting.predict[j,1] = label
+}
+misclrate.b = 1-compare(boosting.predict, as.data.frame(validation2[["ROI.factor"]]))/nrow(validation2)
+sum(is.na(boosting.predict)==TRUE)
+
+boosting.predict = as.factor(boosting.predict$matrix.0..nrow...nrow.b.predict...ncol...1.)
+boosting.predict = factor(boosting.predict,levels(boosting.predict)[c(4,1:3)])
+tb_boosting = table(predictions = boosting.predict, 
+                    actual = validation2$ROI.factor)  
+print(tb_boosting)
+
+modelData = list()
+CMList = list()
+
+cm = confusionMatrix(boosting.predict, validation2$ROI.factor)
+mr = 1-cm$overall[1][1]
+
+dataRow = c("Tree",1, "Missclassification Rate \n ", mr)
+modelData[[1]] = dataRow
+CMList[[1]] = cm
+```
+
+
+```{r rf}
+############################### rfr #############################
+rffit = randomForest(ROI.factor~.,data=train2,
+                     mtry=5,
+                     ntree=500,
+                     nodesize=50,
+                     importance=T)
+
+err.rate = as.data.frame(rffit$err.rate)
+
+#find the optimal tree number
+opt.tree = which.min(err.rate$OOB)
+#Out-of-bag error plot
+plot(rffit$err.rate[,"OOB"], xlab="# trees", ylab="OOB error", cex=0.3)  
+points(x = opt.tree, 
+       y = err.rate$OOB[opt.tree],
+       pch = 8, col = "red")
+#rerun the random forest model
+rffit = randomForest(ROI.factor~.,data=train2,
+                     mtry=5,
+                     ntree=opt.tree,
+                     nodesize=50,
+                     importance=T,
+                     method = "class")
+varImpPlot(rffit)
+rf_predictions = predict(rffit, validation2)  
+# predict.tb = table(as.numeric(rf_predictions == validation2$ROI.factor))
+# misclrate.rf = as.numeric(predict.tb[1]/nrow(validation2))
+# sum(is.na(rf_predictions)==TRUE)
+
+cm.rf = confusionMatrix(rf_predictions, validation2$ROI.factor)
+mr.rf = 1-cm.rf$overall[1][1]
+
+CMList[[2]] = cm.rf
+
+
+```
+
+```{r svm}
+################## SVM ############################
+
+set.seed(0121)
+lin.tune.out=tune(svm, ROI.factor~., data=train2, kernel="linear", 
+                  ranges=list(cost=c(100,150,200)))
+summary(lin.tune.out)
+lin.cost = lin.tune.out$performances[,1]
+lin.error = lin.tune.out$performances[,2]
+plot(lin.cost, lin.error, type='b')
+points(lin.tune.out$best.parameters,
+       lin.tune.out$best.performance, col = "red",pch = 8)
+misclrate.svm.lin = lin.tune.out$best.performance
+lin.svm <- svm(ROI.factor~., train2, cross = 10, cost = 200, kernel = "linear")
+svmlin.pred = predict(lin.svm, validation2)
+
+tb_svmlin = table(predictions = svmlin.pred, 
+                  actual = validation2$ROI.factor) 
+print(tb_svmlin)
+
+cm.svm.lin = confusionMatrix(svmlin.pred, validation2$ROI.factor)
+mr.svmlin = 1-cm.svm.lin$overall[1][1]
+
+CMList[[3]] = cm.svm.lin
+
+##
+set.seed (0121)
+rad.tune.out=tune(svm, ROI.factor~., data=train2, kernel="radial", 
+                  ranges=list(cost=c(0.1, 1,5,10,50,100, 200),
+                              gamma = c(0.1, 0.5, 1, 5)))
+summary(rad.tune.out)
+rad.tune.out$best.parameters[1]
+rad.cost = rad.tune.out$performances[,1]
+rad.gamma = rad.tune.out$performances[,3]
+rad.error = rad.tune.out$performances[,3]
+
+plot_ly(rad.tune.out$performances, x = ~cost, y = ~gamma, z=~error,
+        marker = list(color = ~error, colorscale = c('#683531','#FFE1A1'), showscale = TRUE))
+
+misclrate.svm.rad = rad.tune.out$best.performance
+
+rad.svm <- svm(ROI.factor~., train2, cross = 10, cost = rad.tune.out$best.parameters[1], 
+               gamma = rad.tune.out$best.parameters[2], kernel = "radial")
+svmrad.pred = predict(rad.svm, validation2)
+
+tb_svmrad = table(predictions = svmrad.pred, 
+                  actual = validation2$ROI.factor) 
+print(tb_svmrad)
+
+cm.svm.rad = confusionMatrix(svmrad.pred, validation2$ROI.factor)
+mr.svmrad = 1-cm.svm.rad$overall[1][1]
+
+CMList[[4]] = cm.svm.rad
+
+###
+set.seed (0121)
+poly.tune.out=tune(svm, ROI.factor~., data=train2, kernel="polynomial", 
+                   ranges=list(cost=c(1,5,10,50,100, 200),
+                               degree = c(1, 2, 5)))
+summary(poly.tune.out)
+poly.tune.out$best.parameters
+poly.cost = poly.tune.out$performances[,1]
+poly.error = poly.tune.out$performances[,2]
+plot_ly(poly.tune.out$performances, x = ~cost, y = ~degree, z=~error,
+        marker = list(color = ~error, colorscale = c('#683531','#FFE1A1'), showscale = TRUE))
+
+misclrate.svm.poly = poly.tune.out$best.performance
+
+poly.svm <- svm(ROI.factor~., train2, cross = 10, cost = poly.tune.out$best.parameters[1],
+                degree = poly.tune.out$best.parameters[2], kernel = "polynomial")
+svmpoly.pred = predict(poly.svm, validation2)
+
+tb_svmpoly = table(predictions = svmpoly.pred, 
+                  actual = validation2$ROI.factor) 
+print(tb_svmpoly)
+
+cm.svm.poly = confusionMatrix(svmpoly.pred, validation2$ROI.factor)
+mr.svmpoly = 1-cm.svm.poly$overall[1][1]
+
+CMList[[5]] = cm.svm.poly
+```
+
+```{r nn, include = FALSE}
+#################### Neural Network ###################
+
+str(total2)
+
+colidx = vector()
+for (i in (1:ncol(total2))){
+  if (is.factor(total2[[i]])){
+    colidx = c(colidx, i)
+  }
+}
+str(total2)
+total.factor = as.data.frame(total2[,colidx])
+total.num = as.data.frame(total2[,-colidx])
+
+total.num.scale = scale(total.num)
+try = model.matrix(~ Retailer+PlanningCustomerDescription+SAPCategoryName+SAPPromotedGroupName+IsFeature+isDisplay+
+                     isTPR+isFeatureDisplay+isEDLP+Season-1, data = total.factor)
+
+total.nn = cbind(total.num.scale, try)
+
+set.seed(0121)
+id = sample(nrow(total.nn), 0.6*nrow(total.nn))
+x.train.nn = total.nn[id,]
+x.validation.nn = total.nn[-id,]
+
+y.train = model.matrix( ~ total.factor$ROI.factor - 1)[id,]
+y.val = model.matrix( ~ total.factor$ROI.factor - 1)[-id,]
+
+#### with two layers 128, 64, 4, the model is overfitting
+model <- keras_model_sequential() 
+model %>% 
+  # relu is a commonly used activation function to add nonlinearity into our model
+  # units is the number of nuerons in this layer 
+  layer_dense(units = 256, activation = "relu", input_shape = c(54)) %>% 
+  layer_dropout(rate = 0) %>% 
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dropout(rate = 0) %>%
+  # layer_dense(units = 32, activation = "relu") %>%
+  # layer_dropout(rate = 0) %>%
+  layer_dense(units = 4, activation = "softmax")
+
+model %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_rmsprop(),
+  metrics = c("accuracy"))
+
+early_stop <- callback_early_stopping(monitor = "val_loss", verbose = 1, patience = 10)
+
+history <- model %>% fit(
+  x.train.nn, y.train, 
+  epochs = 100, batch_size = 1000, 
+  callbacks = list(early_stop),
+  validation_split = 0.2)
+
+plot(history)
+
+model %>% evaluate(x.validation.nn, y.val,verbose = 0)
+#nn.predict = model %>% predict_classes(x.validation.nn)
+y_prob = model%>%predict(x.validation.nn) 
+
+colnames(y_prob) = c("horrible", "bad", "good", "great")
+y_prob = as.data.frame(y_prob)
+
+cate = data.frame(matrix(nrow = nrow(y_prob)))
+for (j in 1:nrow(y_prob)){
+  label = names(which.max(y_prob[j,]))
+  cate[j,1] = label
+}
+
+actual = total.factor$ROI.factor[-id]
+nn.predict = as.factor(cate$matrix.nrow...nrow.y_prob..)
+nn.predict = factor(nn.predict,levels(nn.predict)[c(4,1:3)])
+
+cm.nn = confusionMatrix(nn.predict, actual)
+mr.nn = 1-cm.nn$overall[1][1]
+
+CMList[[6]] = cm.nn
+
+```
+
+```{r summary}
+################### create table #################
+
+b.tb = as.data.frame(round(CMList[[1]]$byClass[,c(1:2,11)],2))
+rf.tb = as.data.frame(round(CMList[[2]]$byClass[,c(1:2,11)],2))
+svmlin.tb = as.data.frame(round(CMList[[3]]$byClass[,c(1:2,11)],2))
+svmrad.tb = as.data.frame(round(CMList[[4]]$byClass[,c(1:2,11)],2))
+svmpoly.tb = as.data.frame(round(CMList[[5]]$byClass[,c(1:2,11)],2))
+nn.tb = as.data.frame(round(CMList[[6]]$byClass[,c(1:2,11)],2))
+
+result = cbind(b.tb, rf.tb, svmlin.tb, svmrad.tb, svmpoly.tb,nn.tb)
+
+row = c(rep("Boosting",3), rep("RF",3),
+        rep("SVM-Lin",3),rep("SVM-Rad",3),rep("SVM-Poly",3),
+        rep("NN",3))
+result = rbind(row, result)
+write.csv(result, "ROIfactor_resulttable_with EDLP.csv")
+knitr::knit_exit()
+```
+
+```{r rfe}
+
+#### RFE ####
+######this takes a long time to run, so leaves it at the very end#####
+no.na = na.omit(train2)
+x = data.matrix(no.na[,1:20])
+y = no.na[,20]
+
+rfectrl <- rfeControl(functions=caretFuncs, method="cv",number=10,verbose=TRUE,returnResamp = "final")
+svmProfile <- rfe(x, y,
+                  sizes = c(5,10,15,20),
+                  rfeControl =rfectrl,
+                  method = "svmRadial")
+print(svmProfile)
+predictors(svmProfile)
+plot(svmProfile, type=c("g", "o"))
+######Including all variables are the most accurate model######
+####
+
+
+```
